@@ -12,15 +12,54 @@ class FiredRule(BaseModel):
     description: str
     strength: Optional[float] = None
 
-# gotta work on this later, just a placeholder for now
-class PredictRequest(BaseModel):
-    age: int = Field(..., example=58)
-    tumor_size_cm: float = Field(..., example=4.2)
-    imaging_modality: str = Field(..., example="CT")
 
+    # app/schemas.py
+from pydantic import BaseModel, Field
+from typing import Optional
+
+# ── Single-sample input ───────────────────────────────────────────────────────
+class ClinicalFeatures(BaseModel):
+    """Key-value map of clinical feature name → float value."""
+    features: dict[str, float]
+
+class PredictRequest(BaseModel):
+    subject_id: str
+    clinical: ClinicalFeatures
+    # base64-encoded .npz bytes per modality, e.g. {"MRI": "<b64>", "CT": "<b64>"}
+    modalities: dict[str, str] = Field(default_factory=dict)
+
+class BatchPredictRequest(BaseModel):
+    samples: list[PredictRequest]
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+class FuzzyRule(BaseModel):
+    conditions: str
+    strength: float
+
+class FusionWeights(BaseModel):
+    w_clinical: float
+    w_visual: float
 
 class PredictResponse(BaseModel):
+    subject_id: str
     prediction: int
-    confidence: float
-    top_features: list[TopFeature]
-    fired_rules: list[FiredRule]
+    probability: float
+    threshold: float
+    fusion_weights: FusionWeights
+    anfis_rules: list[FuzzyRule]
+    modality_status: dict[str, str]  # {"MRI": "present", "CT": "missing"}
+
+class BatchPredictResponse(BaseModel):
+    results: list[PredictResponse]
+
+class MetadataResponse(BaseModel):
+    dataset_name      : str
+    modalities        : list[str]
+    clinical_features : list[str]
+    n_fuzzy_sets      : int
+    threshold         : float
+    target_names      : list[str]
+    device            : str
+    best_epoch        : int
+    val_bacc          : float
+    val_auc           : float
