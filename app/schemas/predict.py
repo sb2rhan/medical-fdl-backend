@@ -12,11 +12,6 @@ class FiredRule(BaseModel):
     description: str
     strength: Optional[float] = None
 
-
-    # app/schemas.py
-from pydantic import BaseModel, Field
-from typing import Optional
-
 # ── Single-sample input ───────────────────────────────────────────────────────
 class ClinicalFeatures(BaseModel):
     """Key-value map of clinical feature name → float value."""

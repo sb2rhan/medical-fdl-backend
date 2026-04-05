@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.schemas import PredictRequest, PredictResponse, BatchPredictRequest, BatchPredictResponse
+from app.schemas.predict import PredictRequest, PredictResponse, BatchPredictRequest, BatchPredictResponse
 from app.model_loader import load_artifacts
 from app.inference import run_single
 import asyncio, concurrent.futures

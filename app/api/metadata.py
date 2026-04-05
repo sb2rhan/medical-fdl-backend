@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.schemas import MetadataResponse
+from app.schemas.predict import MetadataResponse
 from app.model_loader import load_artifacts
 
 router = APIRouter(prefix="/api", tags=["metadata"])

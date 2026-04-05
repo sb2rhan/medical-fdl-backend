@@ -4,7 +4,8 @@ from functools import lru_cache
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass
-from model import AgnosticHybridFusion, ModalityConfig
+from model.architecture import AgnosticHybridFusion
+from model.data_config import ModalityConfig
 
 ARTIFACTS = Path("artifacts")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

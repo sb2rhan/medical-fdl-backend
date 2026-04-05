@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.schemas import PredictRequest
+from app.schemas.predict import PredictRequest
 from app.model_loader import load_artifacts
 from app.inference import run_single
 

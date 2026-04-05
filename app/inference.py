@@ -1,6 +1,6 @@
 # app/inference.py
 import base64, io, numpy as np, torch
-from app.schemas import PredictRequest, PredictResponse, FuzzyRule, FusionWeights
+from app.schemas.predict import PredictRequest, PredictResponse, FuzzyRule, FusionWeights
 
 def _decode_npz(b64_str: str) -> np.ndarray:
     """Decode a base64-encoded .npz and return the first array."""
