@@ -1,311 +1,803 @@
-import nibabel as nib
-import torch
-import torch.nn as nn
-import numpy as np
+"""
+feature_extractor.py
+====================
+Offline MRI/CT feature extractor using a MedicalNet-pretrained ResNet3D backbone.
+
+Produces 512-dim L2-normalized feature vectors saved as .npz files.
+OUTPUT_DIM = 512 must match ModalityConfig.input_dim in your AG-HFD config.
+
+Quick start
+-----------
+1. Download MedicalNet weights (ResNet-10 recommended — fastest, fits on CPU):
+       https://drive.google.com/drive/folders/1eXJWd5_rbMKg60kBzBJAGMbABTBRJc4M
+   Save as:  weights/resnet_10_23dataset.pth   (or resnet_18 / resnet_34)
+
+2. Run shape check + full extraction:
+       python feature_extractor.py
+
+Dependencies
+------------
+    pip install torch nibabel pydicom tqdm
+    pip install SimpleITK        # optional but recommended for robust DICOM loading
+"""
+
 import os
 import glob
 import json
+import datetime
+import warnings
 from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import nibabel as nib
 from tqdm import tqdm
 
 
-# --- PART 1: TENSOR EXTRACTION (unchanged from original) ---
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS  (must match ModalityConfig.input_dim in your AG-HFD checkpoint)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def load_oasis_mri(hdr_path, target_shape=(128, 256, 256)):
-    """
-    Loads an OASIS .hdr/.img pair and returns a PyTorch-ready 4D tensor.
-    Format: (Channel, Depth, Height, Width)
-    """
-    img = nib.load(hdr_path)
-    data = img.get_fdata()
+OUTPUT_DIM   = 512          # ResNet10/18/34 backbone output dim — do not change
+TARGET_SHAPE = (96, 128, 128)  # (D, H, W) canonical size fed to the CNN
 
-    tensor = torch.from_numpy(data).float()
-    tensor = tensor.squeeze()  # Remove trailing 1s -> (256, 256, 128)
-
-    if tensor.ndim == 3:
-        tensor = tensor.permute(2, 0, 1)  # (128, 256, 256)
-
-    # Min-Max normalization to [0, 1]
-    t_min, t_max = tensor.min(), tensor.max()
-    if t_max > t_min:
-        tensor = (tensor - t_min) / (t_max - t_min)
-
-    tensor = tensor.unsqueeze(0)  # (1, 128, 256, 256)
-    return tensor
+# MedicalNet input normalisation statistics (from the original paper)
+MEDICALNET_MEAN = 58.09
+MEDICALNET_STD  = 49.73
 
 
-# --- PART 2: 3D CNN FEATURE EXTRACTOR ---
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 1 — MedicalNet ResNet3D architecture
+#
+# Matches the exact layer names in resnet_10_23dataset.pth so that
+# load_state_dict() works without key remapping.
+# Reference: https://github.com/Tencent/MedicalNet
+# ═════════════════════════════════════════════════════════════════════════════
 
-class MRI3DFeatureExtractor(nn.Module):
-    """
-    A 3D CNN that maps an MRI volume (1, D, H, W) to a flat 1024-dim feature vector.
+class BasicBlock3D(nn.Module):
+    """Standard residual block with two 3×3×3 convolutions."""
+    expansion = 1
 
-    Architecture:
-        Block 1: Conv3d(1  -> 32)  + BN + ReLU + MaxPool  -> /2 spatial
-        Block 2: Conv3d(32 -> 64)  + BN + ReLU + MaxPool  -> /2 spatial
-        Block 3: Conv3d(64 -> 128) + BN + ReLU + MaxPool  -> /2 spatial
-        Block 4: Conv3d(128-> 256) + BN + ReLU + MaxPool  -> /2 spatial
-        Global Average Pool (spatial dims -> 1x1x1)
-        FC: 256 -> 1024
-        L2-normalize output
-    """
-
-    def __init__(self):
+    def __init__(self, inplanes: int, planes: int, stride: int = 1,
+                 downsample: Optional[nn.Module] = None):
         super().__init__()
+        self.conv1 = nn.Conv3d(inplanes, planes, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm3d(planes)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(planes, planes, kernel_size=3,
+                               padding=1, bias=False)
+        self.bn2       = nn.BatchNorm3d(planes)
+        self.downsample = downsample
+        self.stride     = stride
 
-        def conv_block(in_ch, out_ch):
-            return nn.Sequential(
-                nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm3d(out_ch),
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        return self.relu(out + residual)
+
+
+class Bottleneck3D(nn.Module):
+    """1×1×1 → 3×3×3 → 1×1×1 bottleneck block (ResNet50+)."""
+    expansion = 4
+
+    def __init__(self, inplanes: int, planes: int, stride: int = 1,
+                 downsample: Optional[nn.Module] = None):
+        super().__init__()
+        self.conv1 = nn.Conv3d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1   = nn.BatchNorm3d(planes)
+        self.conv2 = nn.Conv3d(planes, planes, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm3d(planes)
+        self.conv3 = nn.Conv3d(planes, planes * self.expansion,
+                               kernel_size=1, bias=False)
+        self.bn3        = nn.BatchNorm3d(planes * self.expansion)
+        self.relu       = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride     = stride
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        return self.relu(out + residual)
+
+
+class MedicalResNet3D(nn.Module):
+    """
+    3D ResNet backbone compatible with MedicalNet pretrained weights.
+
+    Supported depths and their layer configs:
+        ResNet-10 : layers=[1,1,1,1],  block=BasicBlock3D  → 512-d output
+        ResNet-18 : layers=[2,2,2,2],  block=BasicBlock3D  → 512-d output
+        ResNet-34 : layers=[3,4,6,3],  block=BasicBlock3D  → 512-d output
+        ResNet-50 : layers=[3,4,6,3],  block=Bottleneck3D  → 2048-d output
+
+    The projection head maps backbone output → OUTPUT_DIM (512).
+    For ResNet-10/18/34 this is an identity mapping (512→512).
+    For ResNet-50 it is a 2048→512 linear layer.
+    """
+
+    def __init__(self, block, layers: list[int], out_dim: int = OUTPUT_DIM):
+        super().__init__()
+        self.inplanes = 64
+
+        # Stem (matches MedicalNet naming exactly)
+        self.conv1 = nn.Conv3d(1, 64, kernel_size=7,
+                               stride=(2, 2, 2), padding=(3, 3, 3), bias=False)
+        self.bn1   = nn.BatchNorm3d(64)
+        self.relu  = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool3d(kernel_size=(3, 3, 3), stride=2, padding=1)
+
+        # Residual stages
+        self.layer1 = self._make_layer(block, 64,  layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool3d(1)
+
+        # Projection head: backbone_dim → out_dim
+        backbone_dim = 512 * block.expansion   # 512 for Basic, 2048 for Bottleneck
+        if backbone_dim == out_dim:
+            self.projector = nn.Identity()
+        else:
+            self.projector = nn.Sequential(
+                nn.Linear(backbone_dim, out_dim),
                 nn.ReLU(inplace=True),
-                nn.MaxPool3d(kernel_size=2, stride=2),
             )
 
-        self.encoder = nn.Sequential(
-            conv_block(1,   32),   # (1,128,256,256) -> (32,64,128,128)
-            conv_block(32,  64),   # -> (64,32,64,64)
-            conv_block(64,  128),  # -> (128,16,32,32)
-            conv_block(128, 256),  # -> (256,8,16,16)
-        )
+        self._init_weights()
 
-        self.global_avg_pool = nn.AdaptiveAvgPool3d(1)  # -> (256,1,1,1)
+    def _make_layer(self, block, planes: int, blocks: int,
+                    stride: int = 1) -> nn.Sequential:
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv3d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm3d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
 
-        self.fc = nn.Sequential(
-            nn.Flatten(),          # -> (256,)
-            nn.Linear(256, 1024),
-            nn.ReLU(inplace=True),
-        )
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                        nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor of shape (B, 1, D, H, W)
+            x: (B, 1, D, H, W) normalised volume
         Returns:
-            features: L2-normalized tensor of shape (B, 1024)
+            features: (B, out_dim) L2-normalised
         """
-        x = self.encoder(x)
-        x = self.global_avg_pool(x)
-        x = self.fc(x)
-
-        # L2 normalize so all feature vectors live on the unit sphere
-        # (makes downstream cosine-similarity comparisons valid)
-        x = nn.functional.normalize(x, p=2, dim=1)
-        return x
+        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        x = self.projector(x)
+        return F.normalize(x, p=2, dim=1)   # unit sphere → cosine sim is valid
 
 
-# --- PART 3: DATASET DISCOVERY ---
+# ─── Factory functions ───────────────────────────────────────────────────────
+
+def build_resnet10(out_dim: int = OUTPUT_DIM) -> MedicalResNet3D:
+    return MedicalResNet3D(BasicBlock3D, [1, 1, 1, 1], out_dim)
+
+def build_resnet18(out_dim: int = OUTPUT_DIM) -> MedicalResNet3D:
+    return MedicalResNet3D(BasicBlock3D, [2, 2, 2, 2], out_dim)
+
+def build_resnet34(out_dim: int = OUTPUT_DIM) -> MedicalResNet3D:
+    return MedicalResNet3D(BasicBlock3D, [3, 4, 6, 3], out_dim)
+
+def build_resnet50(out_dim: int = OUTPUT_DIM) -> MedicalResNet3D:
+    return MedicalResNet3D(Bottleneck3D, [3, 4, 6, 3], out_dim)
+
+BACKBONE_REGISTRY = {
+    "resnet10": build_resnet10,
+    "resnet18": build_resnet18,
+    "resnet34": build_resnet34,
+    "resnet50": build_resnet50,
+}
+
+
+def load_medicalnet_weights(
+    model: MedicalResNet3D,
+    weights_path: str,
+    strict: bool = False,          # False because we added the projector head
+) -> MedicalResNet3D:
+    """
+    Load MedicalNet pretrained weights into the backbone.
+
+    MedicalNet .pth files store weights under a 'state_dict' key with
+    a 'module.' prefix from DataParallel training.  This function strips
+    the prefix before loading so single-GPU / CPU inference works correctly.
+
+    Download weights from: https://huggingface.co/TencentMedicalNet/MedicalNet-Resnet10
+        → resnet_10_23dataset.pth   (recommended — 45 MB, fastest)
+        → resnet_18_23dataset.pth   (88 MB)
+    """
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(
+            f"MedicalNet weights not found at '{weights_path}'.\n"
+            "Download from: https://huggingface.co/TencentMedicalNet/MedicalNet-Resnet10"
+        )
+
+    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt)   # handle both raw and nested formats
+
+    # Strip DataParallel 'module.' prefix
+    cleaned = {}
+    for k, v in state.items():
+        new_key = k[len("module."):] if k.startswith("module.") else k
+        cleaned[new_key] = v
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=strict)
+
+    # Expected missing: projector.* (new head) — warn on anything else
+    unexpected_real = [k for k in unexpected if "projector" not in k]
+    missing_real    = [k for k in missing    if "projector" not in k]
+    if unexpected_real:
+        warnings.warn(f"Unexpected keys in checkpoint: {unexpected_real[:5]}")
+    if missing_real:
+        warnings.warn(f"Missing keys from checkpoint: {missing_real[:5]}")
+
+    n_loaded = len(cleaned) - len(unexpected_real)
+    print(f"  ✓ Loaded {n_loaded} / {len(cleaned)} pretrained parameters "
+          f"({len(missing)} projector keys initialised from scratch)")
+    return model
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 2 — Loaders (NIfTI, DICOM, legacy .hdr/.img)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def load_nifti(path: str) -> torch.Tensor:
+    """
+    Load .nii / .nii.gz / .hdr+.img → canonical RAS+ orientation → (1, D, H, W).
+    nib.as_closest_canonical() corrects for scanner-specific axis ordering.
+    """
+    img  = nib.load(path)
+    img  = nib.as_closest_canonical(img)        # reorient to RAS+
+    data = img.get_fdata(dtype=np.float32).squeeze()
+
+    if data.ndim != 3:
+        raise ValueError(f"Expected 3D volume after squeeze, got {data.shape} ({path})")
+
+    return torch.from_numpy(data).unsqueeze(0)  # (1, D, H, W)
+
+
+def load_dicom_series(path: str) -> torch.Tensor:
+    """
+    Load a DICOM series from a folder or a single .dcm file.
+
+    Prefers SimpleITK (more robust multi-frame / enhanced DICOM) and
+    falls back to pydicom slice-by-slice stacking when SimpleITK is absent.
+    Always applies RescaleSlope / RescaleIntercept → true HU values.
+    """
+    path = Path(path)
+    folder = path.parent if path.suffix.lower() == ".dcm" else path
+
+    # Try SimpleITK first
+    try:
+        import SimpleITK as sitk
+        reader = sitk.ImageSeriesReader()
+        dcm_names = reader.GetGDCMSeriesFileNames(str(folder))
+        if not dcm_names:
+            raise RuntimeError("No DICOM series found")
+        reader.SetFileNames(dcm_names)
+        itk_image = reader.Execute()
+        vol = sitk.GetArrayFromImage(itk_image).astype(np.float32)  # (D, H, W) in HU
+        return torch.from_numpy(vol).unsqueeze(0)
+
+    except ImportError:
+        pass   # SimpleITK not installed — fall through to pydicom
+
+    # Fallback: pydicom slice stacking
+    import pydicom
+
+    dcm_files = sorted(folder.glob("*.dcm"))
+    if not dcm_files:
+        raise FileNotFoundError(f"No .dcm files in {folder}")
+
+    slices = [pydicom.dcmread(str(f)) for f in dcm_files]
+
+    # Sort by InstanceNumber → SliceLocation → filename order
+    def _sort_key(ds):
+        if hasattr(ds, "InstanceNumber"):  return float(ds.InstanceNumber)
+        if hasattr(ds, "SliceLocation"):   return float(ds.SliceLocation)
+        return 0.0
+
+    slices.sort(key=_sort_key)
+
+    volume = []
+    for ds in slices:
+        px        = ds.pixel_array.astype(np.float32)
+        slope     = float(getattr(ds, "RescaleSlope",     1.0))
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        volume.append(px * slope + intercept)   # now in HU
+
+    vol = np.stack(volume, axis=0)             # (D, H, W)
+    return torch.from_numpy(vol).unsqueeze(0)  # (1, D, H, W)
+
+
+def load_volume(path: str) -> tuple[torch.Tensor, str]:
+    """
+    Dispatch to the right loader based on file extension.
+    Returns (tensor (1,D,H,W), detected_format).
+    """
+    ext = "".join(Path(path).suffixes).lower()
+
+    if ext in (".nii", ".gz", ".nii.gz"):
+        return load_nifti(path), "nifti"
+    if ext in (".img", ".hdr", ".nifti.hdr", ".nifti.img"):
+        return load_nifti(path), "analyze"     # nibabel handles .hdr/.img too
+    if ext in (".dcm",):
+        return load_dicom_series(path), "dicom"
+
+    raise ValueError(
+        f"Unsupported format '{ext}'. Supported: .nii, .nii.gz, "
+        f".img/.hdr (Analyze), .dcm (DICOM series folder)"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 3 — Modality-specific normalisation
+# ═════════════════════════════════════════════════════════════════════════════
+
+def normalize_mri(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Robust percentile-based normalisation.
+    Clips to [p1, p99] before scaling to avoid outlier voxels
+    (e.g. bright artefacts at the scanner bore edge) dominating the range.
+    """
+    lo = torch.quantile(tensor, 0.01)
+    hi = torch.quantile(tensor, 0.99)
+    tensor = tensor.clamp(lo, hi)
+    # Shift to MedicalNet training stats
+    tensor = (tensor - lo) / (hi - lo + 1e-8) * 255.0
+    return (tensor - MEDICALNET_MEAN) / (MEDICALNET_STD + 1e-8)
+
+
+def normalize_ct(
+    tensor: torch.Tensor,
+    window_center: float = 40.0,
+    window_width:  float = 400.0,
+) -> torch.Tensor:
+    """
+    Clinical HU windowing then MedicalNet normalisation.
+
+    Common windows:
+        Soft tissue : center=40,   width=400
+        Brain       : center=40,   width=80
+        Lung        : center=-600, width=1500
+        Bone        : center=400,  width=1800
+    """
+    lo = window_center - window_width / 2.0
+    hi = window_center + window_width / 2.0
+    tensor = tensor.clamp(lo, hi)
+    tensor = (tensor - lo) / (hi - lo) * 255.0
+    return (tensor - MEDICALNET_MEAN) / (MEDICALNET_STD + 1e-8)
+
+
+def normalize_pet(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    PET typically stores SUV values.
+    Log-scale compression followed by MedicalNet normalisation.
+    """
+    tensor = (tensor.clamp(min=0) + 1e-6).log()
+    lo = torch.quantile(tensor, 0.01)
+    hi = torch.quantile(tensor, 0.99)
+    tensor = tensor.clamp(lo, hi)
+    tensor = (tensor - lo) / (hi - lo + 1e-8) * 255.0
+    return (tensor - MEDICALNET_MEAN) / (MEDICALNET_STD + 1e-8)
+
+
+NORMALIZERS = {
+    "MRI": normalize_mri,
+    "CT":  normalize_ct,
+    "PET": normalize_pet,
+}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 4 — Spatial resampling
+# ═════════════════════════════════════════════════════════════════════════════
+
+def resample_volume(tensor: torch.Tensor,
+                    target: tuple = TARGET_SHAPE) -> torch.Tensor:
+    """
+    Trilinear resample (1, D, H, W) → (1, Dt, Ht, Wt).
+    Pure PyTorch — no external registration library needed.
+    """
+    return F.interpolate(
+        tensor.unsqueeze(0),     # (1, 1, D, H, W)
+        size=target,
+        mode="trilinear",
+        align_corners=False,
+    ).squeeze(0)                 # (1, Dt, Ht, Wt)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 5 — Unified preprocessing pipeline
+# ═════════════════════════════════════════════════════════════════════════════
+
+def preprocess(
+    path: str,
+    modality: str = "MRI",
+    ct_window_center: float = 40.0,
+    ct_window_width:  float = 400.0,
+) -> torch.Tensor:
+    """
+    Full pipeline: load → normalise → resample.
+    Returns (1, D, H, W) float32 ready for the ResNet3D backbone.
+    """
+    tensor, fmt = load_volume(path)
+
+    norm_fn = NORMALIZERS.get(modality.upper(), normalize_mri)
+    if modality.upper() == "CT":
+        tensor = norm_fn(tensor, ct_window_center, ct_window_width)
+    else:
+        tensor = norm_fn(tensor)
+
+    tensor = resample_volume(tensor, TARGET_SHAPE)
+    return tensor    # (1, 96, 128, 128)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 6 — Dataset discovery helpers
+# ═════════════════════════════════════════════════════════════════════════════
 
 def find_oasis_img_files(disc1_root: str) -> list[dict]:
     """
-    Recursively walks disc1/ and finds every processed MPRAGE .img file.
+    Walks the OASIS disc1/ layout and returns records for each subject.
 
-    Expected OASIS layout:
+    Expected structure:
         disc1/
           OAS1_XXXX_MR1/
             PROCESSED/MPRAGE/SUBJ_111/
               OAS1_XXXX_MR1_mpr_n4_anon_sbj_111.img
     """
     pattern = os.path.join(
-        disc1_root,
-        "OAS1_*",
-        "PROCESSED", "MPRAGE", "SUBJ_111",
-        "*.img"
+        disc1_root, "OAS1_*", "PROCESSED", "MPRAGE", "SUBJ_111", "*.img"
     )
+    paths = sorted(glob.glob(pattern))
+    records = []
+    for p in paths:
+        normalized = p.replace("\\", "/")
+        parts = normalized.split("/")
+        subject_id = next(
+            (part for part in parts if part.startswith("OAS1_")), None
+        )
+        if subject_id is None:
+            print(f"  ⚠ Could not extract subject ID from: {p} — skipping")
+            continue
+        records.append({
+            "subject_id": subject_id,
+            "path":       p,
+            "modality":   "MRI",
+        })
+    return records
+
+def find_oasis2_img_files(disc1_root: str) -> list[dict]:
+    """
+    Finds EVERY MRI visit for every patient in the OASIS2 dataset.
+
+    Expected layout:
+        OASIS2/
+          OAS2_0001_MR1/RAW/*.hdr  -> Included
+          OAS2_0001_MR2/RAW/*.hdr  -> Included
+    """
+
+    # Use a pattern that finds all .hdr files in any MR folder
+    pattern = os.path.join(
+        disc1_root,
+        "OAS2_*",  # Patient folder + MR session
+        "RAW",
+        "*.hdr"
+    )
+
+    # Get all matching paths
     paths = sorted(glob.glob(pattern, recursive=False))
 
     records = []
+
     for p in paths:
-        # Normalize slashes first (handles Windows backslash paths)
+        # Normalize path for cross-platform compatibility
         normalized = p.replace("\\", "/")
         parts = normalized.split("/")
-        # Subject ID is the OAS1_XXXX_MR1 folder — find it explicitly
-        subject_id = next((part for part in parts if part.startswith("OAS1_")), None)
-        if subject_id is None:
-            print(f"  ⚠ Could not extract subject ID from: {p}, skipping.")
+
+        # The folder name (e.g., 'OAS2_0001_MR1') is usually 2 levels up from the .hdr
+        # or we can find the part that matches the OAS2 pattern
+        folder = next((part for part in parts if part.startswith("OAS2_")), None)
+
+        if folder is None:
+            print(f"  ⚠ Could not extract session ID from: {p}, skipping.")
             continue
-        records.append({"subject_id": subject_id, "img_path": p})#returning the dict
+
+        # Simply add every found file to the records list
+        # No more patient_dict or mr_number comparison
+        records.append({
+            "subject_id": folder,  # e.g., "OAS2_0001_MR1"
+            "path":       p,
+            "modality":   "MRI",
+        })
 
     return records
 
 
-# --- PART 4: BATCH FEATURE EXTRACTION ---
+def find_nifti_files(root: str, modality: str = "MRI") -> list[dict]:
+    """
+    Generic NIfTI discovery: walk `root` and find all .nii / .nii.gz files.
+    Subject ID is inferred from the filename stem.
+    """
+    records = []
+    for ext in ("*.nii", "*.nii.gz"):
+        for p in sorted(glob.glob(os.path.join(root, "**", ext), recursive=True)):
+            stem = Path(p).stem.replace(".nii", "")    # handle .nii.gz
+            records.append({"subject_id": stem, "path": p, "modality": modality})
+    return records
+
+
+def find_dicom_series(root: str, modality: str = "CT") -> list[dict]:
+    """
+    Find DICOM series by locating folders that contain .dcm files.
+    Subject ID = the immediate parent folder name.
+    """
+    records = []
+    seen = set()
+    for p in sorted(glob.glob(os.path.join(root, "**", "*.dcm"), recursive=True)):
+        folder = str(Path(p).parent)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        subject_id = Path(folder).name
+        records.append({
+            "subject_id": subject_id,
+            "path":       folder,
+            "modality":   modality,
+        })
+    return records
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 7 — Batch extraction
+# ═════════════════════════════════════════════════════════════════════════════
 
 def extract_and_save_features(
-    disc1_root: str = "./all",
-    output_dir: str = "./features",
-    device: str | None = None,
-    batch_size: int = 1,          # MRI volumes are huge; keep at 1 unless you have large GPU RAM
-    use_pretrained_weights: bool = False,
-    weights_path: str | None = None,
-):
+    records:          list[dict],
+    output_dir:       str,
+    weights_path:     str,
+    backbone:         str  = "resnet10",
+    device:           Optional[str] = None,
+    ct_window_center: float = 40.0,
+    ct_window_width:  float = 400.0,
+) -> dict:
     """
-    Walks all of disc1/, extracts a 1024-dim feature vector per subject,
-    and saves them to output_dir.
+    Extract features for a list of records and save one .npz per subject.
 
-    Output per subject:
-        features/<subject_id>.npy     – numpy array, shape (1024,)
+    Parameters
+    ----------
+    records         : list of dicts with keys 'subject_id', 'path', 'modality'
+    output_dir      : directory to write .npz files and manifest.json
+    weights_path    : path to MedicalNet .pth file
+    backbone        : one of 'resnet10', 'resnet18', 'resnet34', 'resnet50'
+    device          : 'cuda', 'cpu', or None (auto-detect)
+    ct_window_center: HU window centre for CT modality
+    ct_window_width : HU window width for CT modality
 
-    Also writes:
-        features/manifest.json        – maps subject_id -> .npy path + metadata
+    Returns
+    -------
+    manifest : dict  subject_id → {feature_path, status}
     """
-    # ── Device selection ────────────────────────────────────────────────────
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    dev = torch.device(device)
+    print(f"Using device: {dev}")
 
-    # ── Model ───────────────────────────────────────────────────────────────
-    model = MRI3DFeatureExtractor().to(device)
+    # ── Build and load model ──────────────────────────────────────────────
+    print(f"Building {backbone} backbone …")
+    model = BACKBONE_REGISTRY[backbone](out_dim=OUTPUT_DIM).to(dev)
+    print(f"Loading MedicalNet weights from: {weights_path}")
+    load_medicalnet_weights(model, weights_path)
     model.eval()
 
-    if use_pretrained_weights and weights_path:
-        state = torch.load(weights_path, map_location=device)
-        model.load_state_dict(state)
-        print(f"Loaded weights from {weights_path}")
-    else:
-        print("Using randomly-initialized weights (no pre-training).")
-        print("For meaningful embeddings, fine-tune the model on a classification / "
-              "reconstruction task first, then re-run extraction.")
-
-    # ── Output dir ──────────────────────────────────────────────────────────
     os.makedirs(output_dir, exist_ok=True)
-
-    # ── Discover subjects ───────────────────────────────────────────────────
-    records = find_oasis_img_files(disc1_root)
     if not records:
-        raise FileNotFoundError(
-            f"No OASIS .img files found under '{disc1_root}'. "
-            "Check the path and that the OASIS folder structure is intact."
-        )
-    print(f"Found {len(records)} subject(s) in '{disc1_root}'")
+        raise ValueError("records list is empty — nothing to extract")
 
-    manifest = {}
-    failed   = []
+    print(f"\nFound {len(records)} subject(s)")
+    manifest, failed = {}, []
 
-    # ── Extraction loop ──────────────────────────────────────────────────────
     for rec in tqdm(records, desc="Extracting features"):
-        subject_id = rec["subject_id"]
-        img_path   = rec["img_path"]
-        out_path   = os.path.join(output_dir, f"{subject_id}.npz")
+        sid      = rec["subject_id"]
+        path     = rec["path"]
+        modality = rec.get("modality", "MRI")
+        out_path = os.path.join(output_dir, f"{sid}.npz")
 
-        # Skip already-processed subjects (resume-friendly)
         if os.path.exists(out_path):
-            manifest[subject_id] = {
-                "feature_path": out_path,
-                "img_path": img_path,
-                "status": "skipped (already exists)",
-            }
+            manifest[sid] = {"feature_path": out_path, "status": "skipped (exists)"}
             continue
 
         try:
-            # Load + preprocess
-            tensor = load_oasis_mri(img_path)           # (1, 128, 256, 256)
-            original_shape = np.array(tensor.shape)     # store before adding batch dim
-            tensor = tensor.unsqueeze(0).to(device)     # (1, 1, 128, 256, 256)
+            norm_kwargs = (
+                {"ct_window_center": ct_window_center,
+                 "ct_window_width":  ct_window_width}
+                if modality.upper() == "CT" else {}
+            )
+            tensor = preprocess(path, modality=modality, **norm_kwargs)
+            tensor = tensor.unsqueeze(0).to(dev)    # (1, 1, D, H, W)
 
-            # Forward pass (no gradient tracking needed)
             with torch.no_grad():
-                features = model(tensor)                # (1, 1024)
+                feat = model(tensor)                # (1, 512)
 
-            feature_vec = features.squeeze(0).cpu().numpy()  # (1024,)
+            feat_np = feat.squeeze(0).cpu().numpy()
+            assert feat_np.shape == (OUTPUT_DIM,), \
+                f"Unexpected feature shape: {feat_np.shape}"
 
-            # Sanity check
-            assert feature_vec.shape == (1024,), \
-                f"Unexpected feature shape: {feature_vec.shape}"
-
-            import datetime
+            # Always save under the explicit 'features' key
             np.savez(
                 out_path,
-                features       = feature_vec,                          # (1024,)
-                subject_id     = np.array(subject_id),                 # scalar string
-                img_path       = np.array(img_path),                   # scalar string
-                original_shape = original_shape,                       # (4,) e.g. [1,128,256,256]
-                timestamp      = np.array(datetime.datetime.now().isoformat()),
+                features   = feat_np,
+                subject_id = np.array(sid),
+                modality   = np.array(modality),
+                src_path   = np.array(path),
+                timestamp  = np.array(datetime.datetime.now().isoformat()),
             )
-
-            manifest[subject_id] = {
-                "feature_path": out_path,
-                "img_path": img_path,
-                "status": "ok",
-            }
+            manifest[sid] = {"feature_path": out_path, "status": "ok"}
 
         except Exception as e:
-            print(f"\n  ✗ Failed on {subject_id}: {e}")
-            failed.append({"subject_id": subject_id, "error": str(e)})
-            manifest[subject_id] = {
-                "feature_path": None,
-                "img_path": img_path,
-                "status": f"error: {e}",
-            }
+            print(f"\n  ✗ Failed [{sid}]: {e}")
+            failed.append({"subject_id": sid, "error": str(e)})
+            manifest[sid] = {"feature_path": None, "status": f"error: {e}"}
 
-    # ── Save manifest ────────────────────────────────────────────────────────
+    # ── Manifest ──────────────────────────────────────────────────────────
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    # ── Summary ──────────────────────────────────────────────────────────────
-    ok_count   = sum(1 for v in manifest.values() if v["status"] == "ok")
-    skip_count = sum(1 for v in manifest.values() if "skipped" in v["status"])
-    fail_count = len(failed)
-
-    print(f"\n{'='*50}")
+    ok   = sum(1 for v in manifest.values() if v["status"] == "ok")
+    skip = sum(1 for v in manifest.values() if "skipped" in v["status"])
+    print(f"\n{'='*55}")
     print(f"  Extraction complete!")
-    print(f"  ✓ Extracted : {ok_count}")
-    print(f"  ⏭  Skipped  : {skip_count}")
-    print(f"  ✗ Failed    : {fail_count}")
-    print(f"  Manifest    : {manifest_path}")
-    print(f"{'='*50}")
-
+    print(f"  ✓ Extracted  : {ok}")
+    print(f"  ⏭  Skipped   : {skip}")
+    print(f"  ✗ Failed     : {len(failed)}")
+    print(f"  Manifest     : {manifest_path}")
+    print(f"{'='*55}")
     return manifest
 
 
-# --- PART 5: QUICK SANITY CHECK UTILITY ---
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 8 — Verification utility
+# ═════════════════════════════════════════════════════════════════════════════
 
-def verify_features(output_dir: str = "./features"):
-    """Load and print stats for all saved .npz feature files."""
+def verify_features(output_dir: str) -> None:
+    """
+    Load all .npz files in output_dir and print per-subject stats.
+    Checks: shape, L2 norm (should be ~1.0 since we L2-normalise),
+            NaN/Inf presence, and modality label.
+    """
     npz_files = sorted(glob.glob(os.path.join(output_dir, "*.npz")))
     if not npz_files:
-        print("No .npz files found.")
+        print("No .npz files found — nothing to verify.")
         return
 
-    print(f"Verifying {len(npz_files)} feature file(s)…\n")
-    all_vecs = []
+    print(f"\nVerifying {len(npz_files)} feature file(s) in '{output_dir}' …\n")
+    all_vecs, issues = [], []
+
     for p in npz_files:
-        data    = np.load(p, allow_pickle=True)
-        vec     = data["features"]          # (1024,)
-        subj    = str(data["subject_id"])
-        shape   = tuple(data["original_shape"])
-        ts      = str(data["timestamp"])
-        norm    = np.linalg.norm(vec)
-        all_vecs.append(vec)
-        print(f"  {subj:30s}  features={vec.shape}  norm={norm:.4f}  "
-              f"orig_shape={shape}  extracted={ts}")
+        data     = np.load(p, allow_pickle=True)
+        feat     = data["features"]           # explicit key — never files[0]
+        sid      = str(data["subject_id"])
+        modality = str(data.get("modality", "?"))
+        ts       = str(data.get("timestamp", "?"))
+        norm     = np.linalg.norm(feat)
+        has_nan  = bool(np.isnan(feat).any())
+        has_inf  = bool(np.isinf(feat).any())
+
+        status = "OK"
+        if has_nan:   status = "NaN!"
+        elif has_inf: status = "Inf!"
+        elif abs(norm - 1.0) > 0.01:
+            status = f"norm={norm:.4f} (expected ~1.0)"
+
+        if status != "OK":
+            issues.append(f"{sid}: {status}")
+
+        print(f"  {sid:35s}  shape={feat.shape}  norm={norm:.4f}  "
+              f"modality={modality:4s}  {status}  [{ts[:19]}]")
+        all_vecs.append(feat)
 
     mat = np.stack(all_vecs)
-    print(f"\nAll features matrix: {mat.shape}  (subjects × 1024)")
-    print(f"Global mean: {mat.mean():.4f}  std: {mat.std():.4f}")
+    print(f"\n{'─'*65}")
+    print(f"All features matrix : {mat.shape}  (subjects × {OUTPUT_DIM})")
+    print(f"Global mean         : {mat.mean():.5f}")
+    print(f"Global std          : {mat.std():.5f}")
+    print(f"Mean pairwise cosine: {(mat @ mat.T).mean():.4f}  (1.0 = identical)")
 
+    if issues:
+        print(f"\n⚠  {len(issues)} issue(s) detected:")
+        for iss in issues:
+            print(f"   • {iss}")
+    else:
+        print("\n✓ All feature vectors look healthy.")
 
-# --- PART 6: EXECUTION ---
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 9 — Local test harness
+# ═════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-
-    # ── 1. Quick architecture / shape sanity check ────────────────────────
-    print("── Shape check ──")
-    dummy = torch.randn(1, 1, 128, 256, 256)
-    model = MRI3DFeatureExtractor()
-    with torch.no_grad():
-        out = model(dummy)
-    print(f"Input : {tuple(dummy.shape)}")
-    print(f"Output: {tuple(out.shape)}")   # Expected: (1, 1024)
-    print(f"L2 norm of output: {out.norm(dim=1).item():.4f}")  # Expected: ~1.0
-    print()
-
-    # ── 2. Full dataset extraction ────────────────────────────────────────
-    manifest = extract_and_save_features(
-        disc1_root  = "./all",       # ← root of your OASIS disc1 folder
-        output_dir  = "./features",    # ← where .npy files will be saved
-        device      = None,            # auto-detect GPU/CPU
-    )
-
-    # ── 3. Verify saved features ──────────────────────────────────────────
-    verify_features("./features")
+# if __name__ == "__main__":
+#
+#     # ── CONFIG — edit these three paths before running ────────────────────
+#     WEIGHTS_PATH = "weights/resnet_10_23dataset.pth"   # MedicalNet ResNet-10
+#     DISC1_ROOT   = "/media/user/Новый том/Kamilyam/datasets/OASIS2/scans"
+#     OUTPUT_DIR   = "/media/user/Новый том/Kamilyam/datasets/OASIS2/extracted_features"
+#     # ─────────────────────────────────────────────────────────────────────
+#
+#
+#
+#     # ── 1. Architecture + output shape sanity check ───────────────────────
+#     print("── Shape check ──")
+#     model_test = build_resnet10(out_dim=OUTPUT_DIM)
+#     model_test.eval()
+#
+#     # Use TARGET_SHAPE — the actual input size after preprocessing
+#     dummy = torch.randn(1, 1, *TARGET_SHAPE)    # (1, 1, 96, 128, 128)
+#     with torch.no_grad():
+#         out = model_test(dummy)
+#
+#     print(f"Input        : {tuple(dummy.shape)}")
+#     print(f"Output       : {tuple(out.shape)}")         # Expected: (1, 512)
+#     print(f"L2 norm      : {out.norm(dim=1).item():.4f}")  # Expected: ~1.0
+#     print(f"OUTPUT_DIM   : {OUTPUT_DIM}  (must match ModalityConfig.input_dim)")
+#     print(f"TARGET_SHAPE : {TARGET_SHAPE}  (D, H, W after resampling)")
+#     print()
+#
+#     # ── 2. MedicalNet weights load check (before full extraction) ─────────
+#     print("── Weights load check ──")
+#     if os.path.isfile(WEIGHTS_PATH):
+#         model_pretrained = build_resnet10(out_dim=OUTPUT_DIM)
+#         load_medicalnet_weights(model_pretrained, WEIGHTS_PATH)
+#         print("  ✓ Pretrained weights loaded successfully\n")
+#     else:
+#         print(f"  ⚠ Weights not found at '{WEIGHTS_PATH}'")
+#         print("  Download: https://huggingface.co/TencentMedicalNet/MedicalNet-Resnet10")
+#         print("  Continuing with randomly initialised weights for shape check only.\n")
+#
+#     # ── 3. Full OASIS dataset extraction ──────────────────────────────────
+#     print("── Full dataset extraction ──")
+#     records = find_oasis2_img_files(DISC1_ROOT)
+#
+#     if not records:
+#         print(f"  ⚠ No OASIS .img files found under '{DISC1_ROOT}'")
+#         print("  Check the path in the CONFIG section and ensure the expected folder structure.")
+#     else:
+#         manifest = extract_and_save_features(
+#             records      = records,
+#             output_dir   = OUTPUT_DIR,
+#             weights_path = WEIGHTS_PATH,
+#             backbone     = "resnet10",   # swap to resnet18/34/50 for more capacity
+#             device       = None,         # auto-detect GPU / CPU
+#         )
+#
+#     # ── 4. Verify saved features ──────────────────────────────────────────
+#     verify_features(OUTPUT_DIR)
