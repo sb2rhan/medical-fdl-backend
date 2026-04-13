@@ -12,5 +12,5 @@ chromadb>=0.5
 python-dotenv>=1.0
 nibabel>=5.2
 tqdm>=4.66
-
+pydicom>=2.4
 simpleitk
