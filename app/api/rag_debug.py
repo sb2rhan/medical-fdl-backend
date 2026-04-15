@@ -1,3 +1,6 @@
+# DEBUG ONLY — do NOT register this router in main.py for production deployments.
+# Exposes ChromaDB retrieval results without authentication for local development only.
+# To test locally: temporarily add `app.include_router(rag_debug.router)` in main.py.
 from fastapi import APIRouter, Query
 from app.services.chroma_store import ChromaStore
 

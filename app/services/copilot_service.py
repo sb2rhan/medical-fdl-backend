@@ -1,5 +1,12 @@
+import json, re
 from app.services.chroma_store import ChromaStore
 from app.services.llm_client import LLMClient
+
+
+def _word_overlap(text: str, terms: list[str]) -> bool:
+    # Word-boundary aware — avoids 'age' falsely matching 'stage'
+    words = set(re.findall(r'[a-z_][a-z0-9_]*', text.lower()))
+    return any(t.lower() in words for t in terms)
 
 
 class CopilotService:
@@ -11,62 +18,45 @@ class CopilotService:
         if not retrieved:
             return True, "No documents were retrieved from the knowledge base."
 
-        top_features = explanation_payload.get("top_features", [])
-        fired_rules = explanation_payload.get("fired_rules", [])
+        # FIX: use anfis_rules (actual PredictResponse field), not fired_rules/top_features
+        anfis_rules = explanation_payload.get("anfis_rules", [])
 
-        feature_names = [feature["name"].lower() for feature in top_features]
-        rule_ids = [rule["id"].lower() for rule in fired_rules]
+        # Extract condition keywords from ANFIS rules e.g. "age=HIGH & tumor_size=MED"
+        rule_terms = []
+        for rule in anfis_rules:
+            conditions = rule.get("conditions", "") if isinstance(rule, dict) else getattr(rule, "conditions", "")
+            rule_terms += re.findall(r'[a-z_][a-z0-9_]*', conditions.lower())
 
         retrieved_text = " ".join(item["text"].lower() for item in retrieved)
-
-        feature_match = any(name in retrieved_text for name in feature_names)
-        rule_match = any(rule_id in retrieved_text for rule_id in rule_ids)
-
-        if not feature_match and not rule_match:
-            return True, (
-                "Retrieved documents do not align well with the model's top features "
-                "or fired rules."
-            )
-
+        if not _word_overlap(retrieved_text, rule_terms):
+            return True, "Retrieved docs don't align with model ANFIS rules."
         return False, ""
-    
+
     def _build_retrieval_query(self, question: str, explanation_payload: dict) -> str:
-        top_features = explanation_payload.get("top_features", [])
-        fired_rules = explanation_payload.get("fired_rules", [])
-
-        feature_names = [feature["name"] for feature in top_features]
-        rule_ids = [rule["id"] for rule in fired_rules]
-
-        parts = [question] + feature_names + rule_ids
+        # FIX: build query from anfis_rules conditions
+        anfis_rules = explanation_payload.get("anfis_rules", [])
+        rule_terms = []
+        for rule in anfis_rules:
+            conditions = rule.get("conditions", "") if isinstance(rule, dict) else getattr(rule, "conditions", "")
+            rule_terms += re.findall(r'[a-z_][a-z0-9_]*', conditions.lower())
+        parts = [question] + list(dict.fromkeys(rule_terms))  # deduplicated, order-preserving
         return " ".join(parts)
 
-    def generate_answer(self, question: str, explanation_payload: dict):
+    async def generate_answer(self, question: str, explanation_payload: dict):
         self.store.seed_if_empty()
-        retrieval_query = self._build_retrieval_query(question, explanation_payload)
-        retrieved = self.store.query(question=retrieval_query, k=3)
-
-        should_abstain, reason = self._should_abstain(
-            explanation_payload=explanation_payload,
-            retrieved=retrieved,
+        retrieved = self.store.query(
+            question=self._build_retrieval_query(question, explanation_payload), k=3
         )
+        should_abstain, reason = self._should_abstain(explanation_payload, retrieved)
 
         if should_abstain:
-            abstention_response = {
-                "summary": "I do not have enough grounded evidence to answer confidently.",
-                "model_rationale": (
-                    "The current retrieved documents do not align strongly enough with the "
-                    "model's explanation payload."
-                ),
-                "evidence": [],
-                "citations": [],
+            return json.dumps({
+                "summary": "Insufficient grounded evidence to answer confidently.",
+                "model_rationale": "Retrieved documents don't align with model explanation.",
+                "evidence": [], "citations": [],
                 "limitations": reason,
-                "uncertainty": (
-                    "The available corpus may be incomplete or not sufficiently relevant "
-                    "to this question."
-                ),
-            }
-            import json
-            return json.dumps(abstention_response), retrieved
+                "uncertainty": "The corpus may be incomplete.",
+            }), retrieved
 
         context_text = "\n\n".join(
             [f"[{item['id']}] {item['text']}" for item in retrieved]
@@ -83,7 +73,7 @@ Question:
 {question}
 
 Model Output:
-{explanation_payload}
+{json.dumps(explanation_payload, indent=2)}
 
 Retrieved Context:
 {context_text}
@@ -110,6 +100,6 @@ Return this exact JSON shape:
   "uncertainty": "string"
 }}
 """
-
-        raw_response = self.llm.chat(system_prompt, user_prompt)
+        # FIX: await the async chat call (was missing await, returning coroutine object)
+        raw_response = await self.llm.chat(system_prompt, user_prompt)
         return raw_response, retrieved

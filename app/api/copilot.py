@@ -1,22 +1,29 @@
-from fastapi import APIRouter, HTTPException
+import json
+from pydantic import ValidationError
+from fastapi import APIRouter, HTTPException, Depends
 from app.schemas.copilot import CopilotRequest, CopilotResponse
 from app.services.copilot_service import CopilotService
+from app.core.auth import require_api_key
 
 router = APIRouter(prefix="/api", tags=["copilot"])
 
 
-@router.post("/copilot/answer", response_model=CopilotResponse)
-def copilot_answer(payload: CopilotRequest):
+@router.post("/copilot", response_model=CopilotResponse, dependencies=[Depends(require_api_key)])
+async def copilot_answer(req: CopilotRequest):
+    service = CopilotService()
     try:
-        service = CopilotService()
-
-        raw_response, retrieved = service.generate_answer(
-            question=payload.question,
-            explanation_payload=payload.explanation_payload.model_dump(),
+        raw, retrieved = await service.generate_answer(
+            question=req.question,
+            explanation_payload=req.explanation_payload.model_dump(),
         )
-
-        parsed = CopilotResponse.model_validate_json(raw_response)
-        return parsed
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # FIX: strip markdown fences the LLM sometimes emits before JSON.loads
+    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        parsed = CopilotResponse.model_validate(json.loads(cleaned))
+    except (ValidationError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {e}")
+
+    return parsed
