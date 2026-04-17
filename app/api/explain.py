@@ -1,4 +1,5 @@
 import asyncio
+import torch
 import concurrent.futures
 from fastapi import APIRouter, HTTPException, Depends
 from app.schemas.predict import PredictRequest
@@ -13,39 +14,45 @@ _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 def _get_membership_params(artifacts: dict) -> list[dict]:
     """
     Extract ANFIS membership function parameters for each selected feature.
-    Returns Gaussian (mu, sigma), trapezoidal (a,b,c,d), and blend weight
-    for every feature x fuzzy-set combination.
+    Matches the actual ANFIS implementation in model.architecture.ANFIS.
     """
     try:
         anfis = artifacts["model"].anfis
         feature_names = artifacts["features"]
         n_fuzzy_sets = artifacts["n_fuzzy_sets"]
+
+        # mf_mix is a single global scalar; convert to [0,1] blend weight
+        global_blend = round(float(torch.sigmoid(anfis.mf_mix).item()), 4)
+
         mf_params = []
+        labels = ["LOW", "MED", "HIGH"]
+
         for i, name in enumerate(feature_names):
             entry = {"feature": name, "sets": []}
+
             for s in range(n_fuzzy_sets):
-                try:
-                    entry["sets"].append({
-                        "set_index": s,
-                        "label": ["LOW", "MED", "HIGH"][s],
-                        "gaussian": {
-                            "mu":    round(float(anfis.gauss_mu[i, s].item()), 4),
-                            "sigma": round(float(anfis.gauss_sigma[i, s].item()), 4),
-                        },
-                        "trapezoid": {
-                            "a": round(float(anfis.trap_params[i, s, 0].item()), 4),
-                            "b": round(float(anfis.trap_params[i, s, 1].item()), 4),
-                            "c": round(float(anfis.trap_params[i, s, 2].item()), 4),
-                            "d": round(float(anfis.trap_params[i, s, 3].item()), 4),
-                        },
-                        "blend_weight": round(float(anfis.blend[i, s].item()), 4),
-                    })
-                except Exception:
-                    entry["sets"].append({"set_index": s, "error": "params unavailable"})
+                entry["sets"].append({
+                    "set_index": s,
+                    "label": labels[s] if s < len(labels) else f"SET_{s}",
+                    "gaussian": {
+                        "mu": round(float(anfis.mu_gauss[i, s].item()), 4),
+                        "sigma": round(float(anfis.sigma_gauss[i, s].item()), 4),
+                    },
+                    "trapezoid": {
+                        "a": round(float(anfis.trap_a[i, s].item()), 4),
+                        "b": round(float(anfis.trap_b[i, s].item()), 4),
+                        "c": round(float(anfis.trap_c[i, s].item()), 4),
+                        "d": round(float(anfis.trap_d[i, s].item()), 4),
+                    },
+                    "blend_weight": global_blend,
+                })
+
             mf_params.append(entry)
+
         return mf_params
-    except Exception:
-        return []  # graceful degradation if ANFIS attribute path differs
+
+    except Exception as e:
+        return [{"error": f"membership extraction failed: {str(e)}"}]
 
 
 @router.post("/rules", dependencies=[Depends(require_api_key)])
