@@ -70,20 +70,31 @@ class CopilotService:
         """
         Detect clearly mismatched questions that should still abstain even if
         a payload exists.
+        Uses word-level matching to avoid false positives like 'ct' appearing
+        inside unrelated words.
         """
-        q = question.lower()
-        rule_terms = _extract_rule_terms(explanation_payload)
+        q_words = set(re.findall(r"[a-z_][a-z0-9_]*", question.lower()))
+        rule_terms = set(_extract_rule_terms(explanation_payload))
 
         # current payload domain is cognitive/OASIS-style if these features exist
         cognitive_terms = {"mmse", "nwbv", "educ", "age"}
         has_cognitive_payload = any(term in rule_terms for term in cognitive_terms)
 
+        # require actual word matches, not substring matches
         kidney_ct_terms = {
             "kidney", "renal", "tumor", "staging", "stage", "ct", "lesion", "mass"
         }
 
-        if has_cognitive_payload and any(term in q for term in kidney_ct_terms):
-            return True
+        # make mismatch stricter: require at least one strong off-domain term,
+        # or two total off-domain tokens, before abstaining
+        strong_off_domain = {"kidney", "renal", "tumor", "staging", "lesion", "mass"}
+        matched_off_domain = q_words.intersection(kidney_ct_terms)
+
+        if has_cognitive_payload:
+            if q_words.intersection(strong_off_domain):
+                return True
+            if len(matched_off_domain) >= 2:
+                return True
 
         return False
 
@@ -125,9 +136,6 @@ class CopilotService:
             question=self._build_retrieval_query(question, explanation_payload),
             k=3
         )
-
-        # For debugging retrieval relevance during development:
-        print("Retrieved IDs:", [item["id"] for item in retrieved])
 
         should_abstain, reason = self._should_abstain(question, explanation_payload, retrieved)
 
