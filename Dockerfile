@@ -1,5 +1,4 @@
-# GPU-capable base image (torch>=2.1 / CUDA 12.1)
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -17,5 +16,4 @@ ENV PYTHONPATH=/app
 
 EXPOSE 8080
 
-# Single worker: multiple workers = multiple GPU processes = VRAM OOM
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

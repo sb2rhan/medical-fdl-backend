@@ -35,6 +35,20 @@ class FusionWeights(BaseModel):
     w_clinical: float
     w_visual: float
 
+class ScanReference(BaseModel):
+    """Reference to a scan in the database."""
+    scan_id: str
+    modality: str
+    file_path: str
+    embedding_path: Optional[str] = None
+
+class PersistenceMetadata(BaseModel):
+    """Metadata for persisting predictions."""
+    patient_id: str
+    case_id: str
+    feature_set_id: str
+    prediction_id: str
+    scans: list[ScanReference]
 
 class PredictResponse(BaseModel):
     subject_id: str
@@ -44,6 +58,7 @@ class PredictResponse(BaseModel):
     fusion_weights: FusionWeights
     anfis_rules: list[FuzzyRule]
     modality_status: dict[str, str]  # {"MRI": "present", "CT": "missing"}
+    persistence: Optional[PersistenceMetadata] = None
 
 
 class BatchPredictResponse(BaseModel):
@@ -62,3 +77,5 @@ class MetadataResponse(BaseModel):
     val_bacc:           float
     val_auc:            float
     calibrator_loaded:  bool     # True when platt_calibrator.pkl was found
+
+

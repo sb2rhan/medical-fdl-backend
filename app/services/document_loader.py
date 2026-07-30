@@ -1,5 +1,52 @@
+from itertools import product
+
+
+FEATURES = ["MMSE", "nWBV", "Age", "Educ"]
+FUZZY_LABELS = ["LOW", "MED"]
+
+
+def _slug(value: str) -> str:
+    return value.lower().replace(" ", "_")
+
+
+def _generate_rule_documents():
+    docs = []
+
+    for labels in product(FUZZY_LABELS, repeat=len(FEATURES)):
+        rule_parts = [f"{feature}={label}" for feature, label in zip(FEATURES, labels)]
+        rule_text = " & ".join(rule_parts)
+
+        rule_id = "rule_" + "_".join(
+            f"{_slug(feature)}_{_slug(label)}"
+            for feature, label in zip(FEATURES, labels)
+        )
+
+        readable_conditions = ", ".join(
+            f"{feature} is {label}" for feature, label in zip(FEATURES, labels)
+        )
+
+        docs.append({
+            "id": rule_id,
+            "text": (
+                f"ANFIS fuzzy rule: {rule_text}. "
+                f"This rule activates when {readable_conditions}. "
+                "The rule combines cognitive score, normalized brain volume, age, and education level. "
+                "Its actual contribution depends on the patient-specific firing strength returned by the model. "
+                "Rules with stronger firing strength have greater influence on the clinical explanation."
+            ),
+            "metadata": {
+                "source": "anfis_rulebook",
+                "title": f"ANFIS Rule: {rule_text}",
+                "chunk_id": f"{rule_id}_chunk_1",
+                "rule_conditions": rule_text,
+            },
+        })
+
+    return docs
+
+
 def get_seed_documents():
-    return [
+    base_docs = [
         {
             "id": "feature_mmse",
             "text": (
@@ -51,18 +98,6 @@ def get_seed_documents():
             },
         },
         {
-            "id": "rule_mmse_low_nwbv_low",
-            "text": (
-                "Model interpretation note: a rule combining low MMSE and low nWBV may push the model "
-                "toward a higher-risk prediction, especially when supported by other clinical factors."
-            ),
-            "metadata": {
-                "source": "rulebook",
-                "title": "Low MMSE and Low nWBV Rule",
-                "chunk_id": "rule_mmse_low_nwbv_low_chunk_1"
-            },
-        },
-        {
             "id": "rule_clinical_only",
             "text": (
                 "Model interpretation note: if MRI is missing, the model can fall back to clinical-only "
@@ -100,4 +135,32 @@ def get_seed_documents():
                 "chunk_id": "guideline_threshold_chunk_1"
             },
         },
+        {
+            "id": "guideline_firing_strength",
+            "text": (
+                "ANFIS interpretation note: firing strength measures how strongly a fuzzy rule is activated "
+                "for a specific patient. A higher firing strength means the rule is more relevant to the "
+                "current prediction explanation."
+            ),
+            "metadata": {
+                "source": "guideline_excerpt",
+                "title": "Firing Strength Interpretation",
+                "chunk_id": "guideline_firing_strength_chunk_1"
+            },
+        },
+        {
+            "id": "guideline_fusion_weights",
+            "text": (
+                "Multimodal fusion note: fusion weights describe how much the final prediction relied on "
+                "clinical information versus visual imaging information. If MRI is missing, the visual weight "
+                "is zero and the clinical weight becomes one."
+            ),
+            "metadata": {
+                "source": "guideline_excerpt",
+                "title": "Fusion Weight Interpretation",
+                "chunk_id": "guideline_fusion_weights_chunk_1"
+            },
+        },
     ]
+
+    return base_docs + _generate_rule_documents()

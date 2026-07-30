@@ -23,9 +23,9 @@
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     FastAPI Application                  │
-│                                                         │
+┌────────────────────────────────────────────────────────┐
+│                     FastAPI Application                │
+│                                                        │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
 │  │  API Layer   │  │ Service Layer│  │ Model Adapter│  │
 │  │              │  │              │  │    Layer     │  │
@@ -36,12 +36,29 @@
 │  │ health.py    │  │ chroma_store │  └──────────────┘  │
 │  │ metadata.py  │  │ llm_client   │                    │
 │  └──────────────┘  └──────────────┘                    │
-│                                                         │
-│         ┌─────────────┐    ┌──────────────────┐        │
-│         │  ChromaDB   │    │  NVIDIA NIM      │        │
-│         │ Vector Store│    │  Llama 3.1 (RAG) │        │
-│         └─────────────┘    └──────────────────┘        │
-└─────────────────────────────────────────────────────────┘
+│                                                        │
+|        ┌──────────────────────┐                        |
+|        │  PostgreSQL          │                        |
+|        │ Patient Cases        │                        |
+|        │ Scans                │                        |
+|        │ Predictions          │                        |
+|        │ Visual Findings      │                        |
+|        │ Evidence Chunks      │                        |
+|        └──────────────────────┘                        |
+|                   │                                    |
+|                   ▼                                    |
+|        ┌──────────────────────┐                        |
+|        │ ChromaDB             │                        |
+|        │ Patient Evidence     │                        |
+|        │ Medical Knowledge    │                        |
+|        └──────────────────────┘                        |
+|                   │                                    |
+|                   ▼                                    |
+|        ┌──────────────────────┐                        |
+|        │ NVIDIA NIM           │                        |
+|        │ Llama 3.1 Copilot    │                        |
+|        └──────────────────────┘                        |
+└────────────────────────────────────────────────────────┘
          ↑
   artifacts/
   best_model.pth        ← AgnosticHybridFusion checkpoint
@@ -50,9 +67,9 @@
 
 The model itself is a **two-stream hybrid**:
 - **ANFIS stream** — TSK Adaptive Neuro-Fuzzy Inference System on L1-selected clinical tabular features. Produces intrinsically interpretable IF-THEN fuzzy rules.
-- **FlatEncoder stream** — Residual MLP on 512-dim L2-normalized image feature vectors (pre-extracted offline by a frozen MedicalNet 3D-ResNet10 backbone).
+- **FlatEncoder stream** — Residual MLP on 512-dim L2-normalized image feature vectors (pre-extracted offline by a frozen MedicalNet 3D-ResNet10 backbone). During raw scan inference (`/api/predict-scan`), MedicalNet ResNet-10 extracts 512-dimensional embeddings on-the-fly, stores them alongside the uploaded scan, and links them to the prediction through PostgreSQL. These embeddings are later referenced by the copilot and future multimodal explanation pipeline.
 - **Fusion Gate** — 2-layer MLP that dynamically weights both streams per sample. Falls back to clinical-only when no imaging is provided.
-- **Platt Calibrator** — Logistic regression layer fit post-training to align predicted probabilities with empirical frequencies.
+- **Platt Calibrator** — Logistic regression layer fit post-training to align predicted probabilities with empirical frequencies. Included for compatibility with earlier experiments. In the current system, probability calibration is disabled because it did not improve validation performance on the available datasets.
 
 ---
 
@@ -81,10 +98,17 @@ medical-fdl-backend/
 │   │   ├── document_loader.py   # Loads medical literature into ChromaDB
 │   │   ├── prediction_service.py# Thin orchestration shim
 │   │   ├── model_adapter.py     # Model interface adapter
-│   │   └── extractor.py        # Import shim for scan_extractor
+│   │   ├──  extractor.py        # Import shim for scan_extractor
+│   │   ├── case_persistence.py      # Persist patients, cases, scans and predictions
+│   │   ├── prediction_enrichment.py # Prediction evidence orchestration
+│   │   ├── evidence_indexer.py      # PostgreSQL ↔ ChromaDB bridge
+│   │   └── visual_explainer.py      # Placeholder visual findings 
 │   ├── schemas/
 │   │   ├── predict.py           # PredictRequest/Response, FuzzyRule, FusionWeights, Metadata
 │   │   └── copilot.py           # CopilotRequest/Response
+│   ├── db/
+      ├── models.py
+      └── session.py
 │   └── core/
 │       ├── config.py            # Pydantic settings (reads .env)
 │       └── auth.py              # API key dependency (X-API-Key header)
@@ -99,6 +123,9 @@ medical-fdl-backend/
 │       ├── best_oasis_model.pt
 │       └── best_oasis_model_calibrator.pkl
 │   # ↑ Copy one of these to artifacts/best_model.pth + platt_calibrator.pkl at root
+├── alembic/
+├── uploads/
+├── features/
 ├── chroma_data/                 # ChromaDB persistence directory
 ├── Dockerfile
 ├── requirements.txt
@@ -215,6 +242,7 @@ All variables are loaded from `.env` via `pydantic-settings`. The app raises a `
 | `NVIDIA_MODEL` | No | `meta/llama-3.1-70b-instruct` | LLM model identifier |
 | `ALLOWED_ORIGINS` | No | *(empty)* | Comma-separated list of allowed CORS origins, e.g. `http://localhost:3000` |
 | `APP_ENV` | No | `production` | Environment label (`development` / `production`) |
+| `DATABASE_URL` | ✅ | - | PostgreSQL connection string |
 
 **Example `.env`:**
 ```env
@@ -224,6 +252,7 @@ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_MODEL=meta/llama-3.1-70b-instruct
 ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
 APP_ENV=development
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/medical_fdl
 ```
 
 ---
@@ -396,7 +425,15 @@ curl -X POST http://localhost:8080/api/predict-scan \
   -F 'MRI=@/data/PAT001_brain.nii.gz'
 ```
 
-Returns the same `PredictResponse` shape as `/api/predict`.
+In addition to generating a prediction, this endpoint:
+
+- stores uploaded scans on disk
+- extracts and stores MedicalNet embeddings
+- persists patients, cases, scans, predictions and fusion weights in PostgreSQL
+- indexes patient-specific evidence into ChromaDB
+- generates placeholder visual findings for future VLM integration
+
+The response additionally contains persistence metadata linking the prediction to the stored database records.
 
 ---
 
@@ -431,7 +468,7 @@ Returns fired fuzzy rules **plus** full ANFIS membership function parameters for
 
 ### `POST /api/copilot`
 
-RAG-powered clinical Q&A. Retrieves relevant medical literature from ChromaDB and generates a grounded natural-language explanation via NVIDIA NIM Llama 3.1. Includes an **abstention mechanism** — if retrieved documents don't align with the model's ANFIS rules, the system abstains instead of hallucinating.
+RAG-powered clinical Q&A. Retrieves both patient-specific evidence (predictions, scans, ANFIS rules, visual findings) and curated medical knowledge from ChromaDB before generating a grounded explanation using NVIDIA NIM. Includes an **abstention mechanism** — if retrieved documents don't align with the model's ANFIS rules, the system abstains instead of hallucinating.
 
 **Request body:**
 ```json
@@ -517,3 +554,4 @@ The frontend repo is at [sb2rhan/medical-fdl-tool](https://github.com/sb2rhan/me
 - **Debug routes** — `app/api/llm_debug.py` and `app/api/rag_debug.py` exist for local development but are **not registered** in `main.py`. Do not add them to production deployments.
 - **Offline feature extraction** — The 3D-ResNet10 backbone (MedicalNet) is used only in `predict_scan` for on-the-fly extraction. For large-scale batch processing, run the standalone feature extractor script from the training repository and pass the resulting `.npz` files directly to `/api/predict`.
 - **Datasets supported** — OASIS-1 (Alzheimer's), OASIS-2 (longitudinal Alzheimer's), MMIST-ccRCC (kidney cancer), UTSW-Glioma (glioma molecular subtype). Switch datasets by swapping the artifacts as described in [Model Artifacts](#model-artifacts).
+- **Persistent case management** — Every `/api/predict-scan` request now creates a linked patient case in PostgreSQL. Uploaded scans, extracted embeddings, prediction results, ANFIS explanations, fusion weights, evidence chunks, and visual findings are stored together to support explainability, auditability, and future multimodal retrieval.

@@ -44,15 +44,29 @@ from typing import Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_api_key
 from app.inference import run_single
 from app.model_loader import load_artifacts
-from app.schemas.predict import ClinicalFeatures, PredictRequest, PredictResponse
+from app.schemas.predict import ClinicalFeatures, PredictRequest, PredictResponse, PersistenceMetadata, ScanReference
 from app.services.scan_extractor import extract_features, _guess_modality
+from app.db.session import get_db
+from app.services.case_persistence import (
+    UploadedScanRecord,
+    persist_prediction_case,
+    persist_visual_findings,
+    get_file_format
+)
+from app.services.visual_explainer import generate_visual_findings
+from app.services.evidence_indexer import index_prediction_evidence, index_visual_findings
+from app.services.prediction_enrichment import enrich_prediction_evidence
 
 router = APIRouter(prefix="/api", tags=["predict"])
 _pool  = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+UPLOAD_ROOT = Path("uploads")
+FEATURE_ROOT = Path("features")
 
 # File extensions that are directly accepted
 _ACCEPTED_EXTS = {".nii", ".gz", ".dcm", ".img", ".hdr", ".zip"}
@@ -98,9 +112,15 @@ async def _save_upload(upload: UploadFile, dest: Path) -> None:
 async def predict_from_scan(
     subject_id: str           = Form(..., description="Patient / subject identifier"),
     clinical:   str           = Form(..., description='JSON ClinicalFeatures: {"features": {"Age": 72, ...}}'),
+
+    patirnt_first_name: str     = Form("Demo", description="Patient's first name"),
+    patient_last_name: str      = Form("Patient", description="Patient's last name"),
+    patient_age: int           = Form(0, description="Patient's age in years"),
+
     MRI: Optional[UploadFile] = File(default=None, description="MRI scan (.nii / .nii.gz)"),
     CT:  Optional[UploadFile] = File(default=None, description="CT scan (.dcm, DICOM folder zip, or .nii)"),
     PET: Optional[UploadFile] = File(default=None, description="PET scan (.nii / .nii.gz)"),
+    db: AsyncSession = Depends(get_db)
 ):
     # -- 1. Parse and validate clinical JSON ----------------------------------
     try:
@@ -152,6 +172,9 @@ async def predict_from_scan(
 
     # -- 4. Save uploads to temp dir, extract features, collect b64 -----------
     modalities_b64: dict[str, str] = {}
+    scan_records: list[UploadedScanRecord] = []
+    safe_subject_id = subject_id.replace("/", "_").replace("\\", "_")  # Avoid subdirs in temp storage
+
     tmp_root = tempfile.mkdtemp(prefix="scan_upload_")
 
     try:
@@ -192,7 +215,27 @@ async def predict_from_scan(
                     detail=f"Extractor returned unexpected shape {features.shape} for {mod_name}.",
                 )
 
+            # Keep for the existing prediction pipeline
             modalities_b64[mod_name] = _npz_to_b64(features)
+
+            # Persist uploaded scan permanently
+            permanent_scan_dir = UPLOAD_ROOT / safe_subject_id / mod_name
+            permanent_scan_dir.mkdir(parents=True, exist_ok=True)
+            permanent_scan_path = permanent_scan_dir / filename
+            shutil.copy2(dest, permanent_scan_path)  # Copy from temp to permanent location
+
+            # Persist extracted MedicalNet embedding permanently
+            feature_dir = FEATURE_ROOT / safe_subject_id / mod_name
+            feature_dir.mkdir(parents=True, exist_ok=True)
+            embedding_path = feature_dir / f"{mod_name.lower()}_embedding.npz"
+            np.savez(embedding_path, features=features)
+
+            scan_records.append(UploadedScanRecord(
+                modality=mod_name,
+                file_path=str(permanent_scan_path),
+                file_format=get_file_format(filename),
+                embedding_path=str(embedding_path)
+            ))
 
         # -- 5. Build a standard PredictRequest and call run_single -----------
         req = PredictRequest(
@@ -212,6 +255,46 @@ async def predict_from_scan(
             raise HTTPException(status_code=504, detail="Model inference timed out.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+        
+        try:
+            # -- 6. Persist the case, scans, features, and prediction results --
+            db_ids = await persist_prediction_case(
+                db,
+                patient_first_name=patirnt_first_name,
+                patient_last_name=patient_last_name,
+                patient_age=patient_age,
+                dataset_subject_id=subject_id,
+                source="OASIS" if subject_id.startswith("OAS") else "external",
+                disease_domain="Alzheimer's Disease",  # TODO: infer from req.clinical.features if possible
+                clinical_features=clinical_data.features,
+                scans=scan_records,
+                prediction_response=result
+            )
+
+            result.persistence = PersistenceMetadata(
+                patient_id=db_ids["patient_id"],
+                case_id=db_ids["case_id"],
+                feature_set_id=db_ids["feature_set_id"],
+                prediction_id=db_ids["prediction_id"],
+                scans=[
+                    ScanReference(**scan) for scan in db_ids["scans"]
+                ]
+            )
+
+            try:
+                await enrich_prediction_evidence(
+                    db=db,
+                    subject_id=subject_id,
+                    result=result,
+                )
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(status_code=500, detail=f"Prediction saved, but evidence enrichment failed: {e}")
+
+            print(f"Saved prediction case with IDs: {db_ids}")
+        except Exception as e:
+            await db.rollback()  # Roll back if persistence fails, but keep the extracted features and uploads for debugging
+            raise HTTPException(status_code=500, detail=f"Prediction succeeded, but database persistence failed: {e}")
 
         return result
 

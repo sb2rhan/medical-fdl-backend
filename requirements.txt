@@ -1,9 +1,10 @@
 fastapi[standard]
 uvicorn[standard]>=0.29
 torch>=2.1.0
-numpy>=1.26
+numpy==1.26.4
 pandas>=2.2
-scikit-learn>=1.4
+scikit-learn==1.6.1
+scipy==1.11.4
 pydantic>=2.6
 pydantic-settings>=2.2
 python-multipart
@@ -14,3 +15,8 @@ nibabel>=5.2
 tqdm>=4.66
 pydicom>=2.4
 simpleitk
+sqlalchemy
+asyncpg
+alembic
+psycopg2-binary
+greenlet 

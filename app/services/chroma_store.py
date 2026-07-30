@@ -29,6 +29,26 @@ class ChromaStore:
         self.collection = self.client.get_or_create_collection(name=self.collection_name)
         self.seed_if_empty()
 
+    def add_document(
+        self, 
+        doc_id: str, 
+        text: str, 
+        metadata: dict | None = None
+    ) -> None:
+        """
+        Add or update one document in ChromaDB.
+
+        Chroma stores:
+        - doc_id: stable identifier
+        - text: retrievable evidence text
+        - metadata: PostgreSQL linkage fields such as prediction_id, scan_id, source_table
+        """
+        self.collection.upsert(
+            ids=[doc_id], 
+            documents=[text],
+            metadatas=[metadata or {}]
+        )
+
     def query(self, question: str, k: int = 3) -> list[dict]:
         results = self.collection.query(
             query_texts=[question],

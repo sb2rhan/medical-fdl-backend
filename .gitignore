@@ -37,3 +37,27 @@ artifacts/platt_calibrator.pkl
 artifacts/best_model.pth
 chroma.sqlite3
 chroma_data/
+scripts/
+convert_oasis_to_nifti.py
+
+# Temporary upload and feature extraction directories
+uploads/
+features/
+data/
+datasets/
+visual_outputs/
+gradcam_outputs/
+*.nii
+*.nii.gz
+*.dcm
+*.hdr
+*.img
+*.npz
+
+# Local databases and database exports
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+*.backup
